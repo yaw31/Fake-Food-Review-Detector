@@ -1,0 +1,126 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Fake Food Review Detector — Demo</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f9fafb; padding: 20px; }
+    h2 { color: #333; }
+    .card {
+      background: #fff;
+      padding: 20px;
+      border-radius: 12px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+      max-width: 900px;
+      margin: auto;
+    }
+    input[type=file] { margin-top: 10px; }
+    button {
+      background: #2563eb;
+      color: white;
+      border: none;
+      padding: 10px 18px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    button:hover { background: #1e40af; }
+    #msg { margin-left: 12px; font-weight: bold; }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin-top: 20px;
+      background: white;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+    th { background: #f3f4f6; }
+    .fake { background: #ffe4e6; }
+    .real { background: #dcfce7; }
+    #downloadLink { display: none; margin-top: 15px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>🍔 Fake Food Review Detector — Demo</h2>
+    <p>Select your dataset (CSV) and click <strong>Run Analysis</strong>.</p>
+    <input type="file" id="fileInput" accept=".csv" />
+    <br><br>
+    <button id="runBtn">Run Analysis</button>
+    <span id="msg"></span>
+    <br>
+    <a id="downloadLink" target="_blank">⬇️ Download Results CSV</a>
+
+    <table id="results">
+      <thead>
+        <tr><th>ID</th><th>Summary</th><th>Sentiment</th><th>Key Phrases</th><th>Score</th><th>Fake?</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+<script>
+const API_URL = "https://yn8jgyjn3i.execute-api.ap-southeast-1.amazonaws.com/analyze"; 
+const BUCKET_URL = "https://my-fake-review-mvp-1.s3.amazonaws.com/"; // your bucket public URL
+
+document.getElementById('runBtn').onclick = async () => {
+  const fileInput = document.getElementById('fileInput');
+  if (!fileInput.files.length) {
+    alert("Please upload a CSV file first.");
+    return;
+  }
+
+  const file = fileInput.files[0];
+  document.getElementById('msg').innerText = 'Uploading & running analysis...';
+
+  // Convert to Base64
+  const reader = new FileReader();
+  reader.onload = async function() {
+    const base64Data = btoa(reader.result);
+
+    try {
+      const res = await fetch(API_URL, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ file: base64Data, filename: file.name })
+      });
+
+      const data = await res.json();
+      document.getElementById('msg').innerText = 'Done ✅';
+
+      // Results
+      const results = data.results || JSON.parse(data.body||'{}').results || [];
+      const outputS3 = data.output_s3 || JSON.parse(data.body||'{}').output_s3;
+      
+      // Show download link
+      if (outputS3) {
+        const s3Path = outputS3.replace("s3://my-fake-review-mvp-1/", "");
+        document.getElementById('downloadLink').href = BUCKET_URL + s3Path;
+        document.getElementById('downloadLink').style.display = 'inline-block';
+        document.getElementById('downloadLink').innerText = "⬇️ Download Results CSV";
+      }
+
+      // Fill table
+      const tbody = document.querySelector('#results tbody');
+      tbody.innerHTML = "";
+      results.forEach(r => {
+        const tr = document.createElement("tr");
+        tr.className = r.fake ? "fake" : "real";
+        tr.innerHTML = `<td>${r.id}</td>
+                        <td>${r.summary}</td>
+                        <td>${r.sentiment}</td>
+                        <td>${r.key_phrases.join(", ")}</td>
+                        <td>${r.score}</td>
+                        <td>${r.fake ? "Yes" : "No"}</td>`;
+        tbody.appendChild(tr);
+      });
+    } catch(e) {
+      document.getElementById('msg').innerText = 'Error: '+e.message;
+    }
+  };
+  reader.readAsBinaryString(file);
+};
+</script>
+</body>
+</html>

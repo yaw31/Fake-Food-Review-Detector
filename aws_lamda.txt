@@ -1,0 +1,156 @@
+import boto3, csv, io, os, time, json, base64
+from urllib.parse import unquote_plus
+
+# Fixed bucket and output folder
+S3_BUCKET = "my-fake-review-mvp-1"
+OUTPUT_PREFIX = "results/"
+
+PROMO_KEYWORDS = [
+    "free drinks","discount","buy 1 get 1","best in town",
+    "must visit","special offer","best ever","highly recommended",
+    "buy now","order today"
+]
+
+s3 = boto3.client("s3")
+comprehend = boto3.client("comprehend")
+
+def analyze_text(text):
+    if not text or text.strip() == "":
+        return "UNKNOWN", {}, []
+    try:
+        sent = comprehend.detect_sentiment(Text=text, LanguageCode="en")
+        k = comprehend.detect_key_phrases(Text=text, LanguageCode="en")
+        return sent.get("Sentiment","UNKNOWN"), sent.get("SentimentScore",{}), [kp["Text"] for kp in k.get("KeyPhrases",[])]
+    except Exception as e:
+        print("comprehend error:", e)
+        return "UNKNOWN", {}, []
+
+def rule_engine(text, sentiment, key_phrases):
+    score = 0
+    t = (text or "").lower()
+    phrases = [p.lower() for p in key_phrases]
+
+    # Strong promo keyword rule (ads)
+    if any(kw in t or any(kw in p for p in phrases) for kw in PROMO_KEYWORDS):
+        score += 3
+
+    # Positive + very short review (like "Great!", "Best ever!")
+    if sentiment == "POSITIVE" and len(t.split()) < 6:
+        score += 2
+
+    # Very short review (no substance)
+    if len(t.split()) <= 3:
+        score += 2
+
+    # Lack of detailed multi-word keyphrases (generic praise only)
+    if len([p for p in phrases if len(p.split()) > 1]) == 0:
+        score += 1
+
+    # Overuse of hype words (generic praise)
+    HYPE_WORDS = ["amazing", "awesome", "fantastic", "excellent", "incredible", "perfect"]
+    if any(hw in t for hw in HYPE_WORDS):
+        score += 1
+
+    # Too many exclamation marks or all caps
+    if text.count("!") > 2 or any(word.isupper() and len(word) > 3 for word in text.split()):
+        score += 1
+
+    # Repetitive words
+    words = t.split()
+    if len(words) > 0:
+        unique_ratio = len(set(words)) / len(words)
+        if unique_ratio < 0.6:  # too repetitive
+            score += 1
+
+    fake_flag = score >= 3
+
+    why = []
+    if any(kw in t or any(kw in p for p in phrases) for kw in PROMO_KEYWORDS):
+        why.append("promo_keywords")
+    if sentiment == "POSITIVE" and len(t.split()) < 6:
+        why.append("short_positive")
+    if len(t.split()) <= 3:
+        why.append("very_short")
+    if len([p for p in phrases if len(p.split()) > 1]) == 0:
+        why.append("lack_of_details")
+    if any(hw in t for hw in HYPE_WORDS):
+        why.append("hype_words")
+    if text.count("!") > 2 or any(word.isupper() and len(word) > 3 for word in text.split()):
+        why.append("shouting_style")
+    if len(words) > 0 and unique_ratio < 0.6:
+        why.append("repetitive")
+
+    return score, fake_flag, why
+
+
+def lambda_handler(event, context):
+    try:
+        body = json.loads(event.get("body", "{}"))
+        file_b64 = body.get("file", "")
+        filename = body.get("filename", f"upload_{int(time.time())}.csv")
+
+        # Decode Base64 CSV
+        csv_data = base64.b64decode(file_b64).decode("utf-8").splitlines()
+        reader = csv.reader(csv_data)
+        rows = list(reader)
+
+        # Detect header and text column
+        header = rows[0]
+        text_idx = None
+        for col in ["reviewtext","text","review","content","body"]:
+            if col in [h.lower() for h in header]:
+                text_idx = [h.lower() for h in header].index(col)
+                break
+
+        if text_idx is None:
+            return {
+                "statusCode": 400,
+                "headers": {"Access-Control-Allow-Origin":"*"},
+                "body": json.dumps({"error":"No review text column found"})
+            }
+
+        # Process rows
+        out_rows = []
+        out_header = header + ["sentiment","key_phrases","suspicion_score","fake_flag","why"]
+        out_rows.append(out_header)
+
+        results = []
+        for idx, r in enumerate(rows[1:], start=1):
+            text = r[text_idx] if text_idx < len(r) else ""
+            sentiment, senti_scores, key_phrases = analyze_text(text)
+            score, fake_flag, why = rule_engine(text, sentiment, key_phrases)
+
+            out_rows.append(r + [sentiment, "|".join(key_phrases), str(score), str(fake_flag), ",".join(why)])
+            results.append({
+                "id": idx,
+                "summary": text[:50],
+                "sentiment": sentiment,
+                "key_phrases": key_phrases,
+                "score": score,
+                "fake": fake_flag
+            })
+
+        # Save to S3
+        ts = int(time.time())
+        out_key = f"{OUTPUT_PREFIX}results_{ts}.csv"
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerows(out_rows)
+
+        s3.put_object(Bucket=S3_BUCKET, Key=out_key, Body=buf.getvalue())
+
+        return {
+            "statusCode": 200,
+            "headers": {"Access-Control-Allow-Origin":"*"},
+            "body": json.dumps({
+                "results": results,
+                "output_s3": f"s3://{S3_BUCKET}/{out_key}"
+            })
+        }
+
+    except Exception as e:
+        return {
+            "statusCode": 500,
+            "headers": {"Access-Control-Allow-Origin":"*"},
+            "body": json.dumps({"error": str(e)})
+        }
